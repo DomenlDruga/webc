@@ -1,7 +1,6 @@
 /.
 /sys
 /bin
-/bin/mountpoint
 /sbin
 /sbin/fsck.nfs
 /etc
@@ -69,7 +68,6 @@
 /run
 /lib
 /lib/init
-/lib/init/vars.sh
 /lib/init/tmpfs.sh
 /lib/init/swap-functions.sh
 /lib/init/mount-functions.sh

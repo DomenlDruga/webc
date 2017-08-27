@@ -5,7 +5,7 @@
 is_live_path()
 {
 	DIRECTORY="${1}/${LIVE_MEDIA_PATH}"
-	for FILESYSTEM in squashfs ext2 ext3 ext4 xfs dir jffs git
+	for FILESYSTEM in squashfs ext2 ext3 ext4 xfs dir jffs
 	do
 		if ls "${DIRECTORY}/"*.${FILESYSTEM} > /dev/null 2>&1
 		then
@@ -17,13 +17,14 @@ is_live_path()
 
 matches_uuid ()
 {
-	if [ "${IGNORE_UUID}" ] || [ ! -e /conf/uuid.conf ]
+	if [ "${IGNORE_UUID}" ] || ([ ! -e /conf/uuid.conf ] && [ ! "${LIVE_MEDIA_UUID}" ])
 	then
 		return 0
 	fi
 
 	path="${1}"
 	uuid="$(cat /conf/uuid.conf)"
+	uuid="${LIVE_MEDIA_UUID:-${uuid}}"
 
 	for try_uuid_file in "${path}/.disk/live-uuid"*
 	do
@@ -98,6 +99,7 @@ check_dev ()
 	sysdev="${1}"
 	devname="${2}"
 	skip_uuid_check="${3}"
+	mount_opts="${LIVE_MEDIA_MOUNT_OPTS:-ro,noatime}"
 
 	# support for fromiso=.../isofrom=....
 	if [ -n "$FROMISO" ]
@@ -114,7 +116,7 @@ check_dev ()
 				ISO_DEVICE=$(dirname ${ISO_DEVICE})
 				[ -b "$ISO_DEVICE" ] && break
 				i=$(($i -1))
-		        done
+			done
 		fi
 
 		if [ "$ISO_DEVICE" = "/" ]
@@ -195,7 +197,7 @@ check_dev ()
 	then
 		devuid=$(blkid -o value -s UUID "$devname")
 		[ -n "$devuid" ] && grep -qs "\<$devuid\>" /var/lib/live/boot/devices-already-tried-to-mount && continue
-		mount -t ${fstype} -o ro,noatime "${devname}" ${mountpoint} || continue
+		mount -t ${fstype} -o "${mount_opts}" "${devname}" ${mountpoint} || continue
 		[ -n "$devuid" ] && echo "$devuid" >> /var/lib/live/boot/devices-already-tried-to-mount
 
 		if [ -n "${FINDISO}" ]
@@ -204,10 +206,10 @@ check_dev ()
 			then
 				umount ${mountpoint}
 				mkdir -p /live/findiso
-				mount -t ${fstype} -o ro,noatime "${devname}" /live/findiso
+				mount -t ${fstype} -o "${mount_opts}" "${devname}" /live/findiso
 				loopdevname=$(setup_loop "/live/findiso/${FINDISO}" "loop" "/sys/block/loop*" 0 "")
 				devname="${loopdevname}"
-				mount -t iso9660 -o ro,noatime "${devname}" ${mountpoint}
+				mount -t iso9660 -o "${mount_opts}" "${devname}" ${mountpoint}
 			else
 				umount ${mountpoint}
 			fi
@@ -235,18 +237,12 @@ find_livefs ()
 {
 	timeout="${1}"
 
-	# don't start autodetection before timeout has expired
-	if [ -n "${LIVE_MEDIA_TIMEOUT}" ]
-	then
-		if [ "${timeout}" -lt "${LIVE_MEDIA_TIMEOUT}" ]
-		then
-			return 1
-		fi
-	fi
-
-	# first look at the one specified in the command line
+	# first look at the one specified in the command line This is OK
+	# before the timeout has expired, if more than one device matches the
+	# criteria the outcome is undefined anyway, so we can pick the first
+	# one that appears.
 	case "${LIVE_MEDIA}" in
-		removable-usb)
+		removable-usb|usb)
 			for sysblock in $(removable_usb_dev "sys")
 			do
 				for dev in $(subdevices "${sysblock}")
@@ -257,9 +253,19 @@ find_livefs ()
 					fi
 				done
 			done
-			return 1
 			;;
-
+		cdrom)
+			for sysblock in $(removable_cdrom_dev "sys")
+			do
+				for dev in $(subdevices "${sysblock}")
+				do
+					if check_dev "${dev}"
+					then
+						return 0
+					fi
+				done
+			done
+			;;
 		removable)
 			for sysblock in $(removable_dev "sys")
 			do
@@ -271,7 +277,6 @@ find_livefs ()
 					fi
 				done
 			done
-			return 1
 			;;
 
 		*)
@@ -285,7 +290,16 @@ find_livefs ()
 			;;
 	esac
 
-	# or do the scan of block devices
+	# don't start autodetection before timeout has expired
+	if [ -n "${LIVE_MEDIA_TIMEOUT}" ]
+	then
+		if [ "${timeout}" -lt "${LIVE_MEDIA_TIMEOUT}" ]
+		then
+			return 1
+		fi
+	fi
+
+	# autodetection of live media
 	# prefer removable devices over non-removable devices, so scan them first
 	devices_to_scan="$(removable_dev 'sys') $(non_removable_dev 'sys')"
 
@@ -420,6 +434,12 @@ is_supported_fs ()
 		return 1
 	fi
 
+	# get_fstype might report "unknown" or "swap", ignore it as no such kernel module exists
+	if [ "${fstype}" = "unknown" ] || [ "${fstype}" = "swap" ]
+	then
+		return 1
+	fi
+
 	# Try to look if it is already supported by the kernel
 	if grep -q ${fstype} /proc/filesystems
 	then
@@ -449,7 +469,7 @@ is_supported_fs ()
 
 get_fstype ()
 {
-	/sbin/blkid -s TYPE -o value $1 2>/dev/null
+	blkid -s TYPE -o value $1 2>/dev/null
 }
 
 where_is_mounted ()
@@ -507,7 +527,7 @@ base_path ()
 {
 	testpath="${1}"
 	mounts="$(awk '{print $2}' /proc/mounts)"
-	testpath="$(busybox realpath ${testpath})"
+	testpath="$(realpath ${testpath})"
 
 	while true
 	do
@@ -625,7 +645,7 @@ setup_loop ()
 					echo "${passphrase}" > /tmp/passphrase
 					unset passphrase
 					exec 9</tmp/passphrase
-					/sbin/losetup ${options} -e "${encryption}" -p 9 "${dev}" "${fspath}"
+					losetup ${options} -e "${encryption}" -p 9 "${dev}" "${fspath}"
 					error=${?}
 					exec 9<&-
 					rm -f /tmp/passphrase
@@ -732,7 +752,7 @@ mount_persistence_media ()
 		fi
 	elif [ "${backing}" != "${old_backing}" ]
 	then
-		if ! mount --move ${old_backing} ${backing} >/dev/null
+		if ! mount -o move ${old_backing} ${backing} >/dev/null
 		then
 			[ -z "${probe}" ] && log_warning_msg "Failed to move persistence media ${device}"
 			rmdir "${backing}"
@@ -772,7 +792,7 @@ close_persistence_media ()
 
 	if is_active_luks_mapping ${device}
 	then
-		/sbin/cryptsetup luksClose ${device}
+		cryptsetup luksClose ${device}
 	fi
 }
 
@@ -786,7 +806,7 @@ open_luks_device ()
 		opts="${opts} --readonly"
 	fi
 
-	if /sbin/cryptsetup status "${name}" >/dev/null 2>&1
+	if cryptsetup status "${name}" >/dev/null 2>&1
 	then
 		re="^[[:space:]]*device:[[:space:]]*\([^[:space:]]*\)$"
 		opened_dev=$(cryptsetup status ${name} 2>/dev/null | grep "${re}" | sed "s|${re}|\1|")
@@ -804,25 +824,23 @@ open_luks_device ()
 	load_keymap
 
 	# check for plymouth
-	if [ -x /bin/plymouth ]
+	[ -x /bin/plymouth ] && plymouth --ping && plymouth="y"
+
+    # export udisk properties (used to get a nice device label)
+    unset ID_VENDOR_ENC ID_MODEL_ENC ID_PART_ENTRY_NUMBER
+    eval $(udevadm info --name=${dev} --query=property -x)
+    [ -z "${ID_VENDOR_ENC}" -a -z "${ID_MODEL_ENC}" ] && ID_MODEL_ENC="Unidentified device"
+    label="$(echo -e "${ID_VENDOR_ENC}${ID_MODEL_ENC}, Partition ${ID_PART_ENTRY_NUMBER} (${dev})")"
+
+	if [ "${plymouth}" = "y" ]
 	then
-		_PLYMOUTH="true"
+		cryptkeyscript="plymouth ask-for-password --prompt"
+		# Plymouth will add a : if it is a non-graphical prompt
+		cryptkeyprompt="Please unlock disk '${label}'"
+	else
+		cryptkeyscript="/lib/cryptsetup/askpass"
+		cryptkeyprompt="Please unlock disk '${label}': "
 	fi
-
-	case "${_PLYMOUTH}" in
-		true)
-			plymouth --ping
-
-			cryptkeyscript="plymouth ask-for-password --prompt"
-			# Plymouth will add a : if it is a non-graphical prompt
-			cryptkeyprompt="Please unlock disk ${dev}"
-			;;
-
-		*)
-			cryptkeyscript="/lib/cryptsetup/askpass"
-			cryptkeyprompt="Please unlock disk ${dev}: "
-			;;
-	esac
 
 	while true
 	do
@@ -837,28 +855,22 @@ open_luks_device ()
 		fi
 
 		echo >&6
-		retryprompt="There was an error decrypting ${dev} ... Retry? [Y/n]"
+		retryprompt="There was an error decrypting '${label}' ... Retry? [Y/n]"
 
-		case "${_PLYMOUTH}" in
-			true)
-				plymouth display-message --text "${retryprompt}"
-				answer=$(plymouth watch-keystroke --keys="YNyn")
-				;;
-
-			*)
-				echo -n "${retryprompt} " >&6
-				read answer
-				;;
-		esac
+		if [ "${plymouth}" == "y" ]
+		then
+			plymouth display-message --text "${retryprompt}"
+			plymouth pause-progress
+			answer=$(plymouth watch-keystroke --keys="YNyn")
+			plymouth unpause-progress
+		else
+			echo -n "${retryprompt} " >&6
+			read answer
+		fi
 
 		if [ "$(echo "${answer}" | cut -b1 | tr A-Z a-z)" = "n" ]
 		then
-			case "${_PLYMOUTH}" in
-				true)
-					plymouth display-message --text ""
-					;;
-			esac
-
+			[ "${plymouth}" = "y" ] && plymouth display-message --text ""
 			return 2
 		fi
 	done
@@ -868,14 +880,14 @@ get_gpt_name ()
 {
     local dev
     dev="${1}"
-    /sbin/blkid -s PART_ENTRY_NAME -p -o value ${dev} 2>/dev/null
+    blkid -s PART_ENTRY_NAME -p -o value ${dev} 2>/dev/null
 }
 
 is_gpt_device ()
 {
     local dev
     dev="${1}"
-    [ "$(/sbin/blkid -s PART_ENTRY_SCHEME -p -o value ${dev} 2>/dev/null)" = "gpt" ]
+    [ "$(blkid -s PART_ENTRY_SCHEME -p -o value ${dev} 2>/dev/null)" = "gpt" ]
 }
 
 probe_for_gpt_name ()
@@ -915,7 +927,7 @@ probe_for_fs_label ()
 
 	for label in ${overlays}
 	do
-		if [ "$(/sbin/blkid -s LABEL -o value $dev 2>/dev/null)" = "${label}" ]
+		if [ "$(blkid -s LABEL -o value $dev 2>/dev/null)" = "${label}" ]
 		then
 			echo "${label}=${dev}"
 		fi
@@ -1074,18 +1086,18 @@ find_persistence_media ()
 			result=$(probe_for_file_name "${overlays}" ${dev})
 			if [ -n "${result}" ]
 			then
-			        local loopdevice
+				local loopdevice
 				loopdevice=${result##*=}
-			        if is_in_comma_sep_list luks ${PERSISTENCE_ENCRYPTION} && is_luks_partition ${loopdevice}
+				if is_in_comma_sep_list luks ${PERSISTENCE_ENCRYPTION} && is_luks_partition ${loopdevice}
 				then
-				        local luksfile
+					local luksfile
 					luksfile=""
 					if luksfile=$(open_luks_device "${loopdevice}")
 					then
-					        result=${result%%=*}
+						result=${result%%=*}
 						result="${result}=${luksfile}"
 					else
-					        losetup -d $loopdevice
+						losetup -d $loopdevice
 						result=""
 					fi
 				fi
@@ -1108,7 +1120,7 @@ find_persistence_media ()
 		# Close luks device if it isn't used
 		if [ -z "${result}" ] && [ -n "${luks_device}" ] && is_active_luks_mapping "${luks_device}"
 		then
-			/sbin/cryptsetup luksClose "${luks_device}"
+			cryptsetup luksClose "${luks_device}"
 		fi
 	done
 
@@ -1139,13 +1151,13 @@ get_mac ()
 is_luks_partition ()
 {
 	device="${1}"
-	/sbin/cryptsetup isLuks "${device}" 1>/dev/null 2>&1
+	cryptsetup isLuks "${device}" 1>/dev/null 2>&1
 }
 
 is_active_luks_mapping ()
 {
 	device="${1}"
-	/sbin/cryptsetup status "${device}" 1>/dev/null 2>&1
+	cryptsetup status "${device}" 1>/dev/null 2>&1
 }
 
 get_luks_backing_device ()
@@ -1158,22 +1170,32 @@ get_luks_backing_device ()
 removable_dev ()
 {
 	output_format="${1}"
-	want_usb="${2}"
+	device_class="${2}"
 	ret=
 
 	for sysblock in $(echo /sys/block/* | tr ' ' '\n' | grep -vE "/(loop|ram|dm-|fd)")
 	do
 		dev_ok=
-		if [ "$(cat ${sysblock}/removable)" = "1" ]
+		if [ "${device_class}" = "usb" ] && readlink ${sysblock} | grep -Eq "/usb[0-9]+/"
 		then
-			if [ -z "${want_usb}" ]
+			# We only want USB and this is an USB device
+			dev_ok="true"
+		elif [ "${device_class}" = "cdrom" ] && echo ${sysblock} | grep -Eq "/sr[0-9]+$"
+		then
+			# We only want CD-ROM devices and this is such a device
+			dev_ok="true"
+		elif [ -z "${device_class}" ]
+		then
+			if readlink ${sysblock} | grep -Eq "/(usb[0-9]+|fw[0-9]+|mmc[0-9]+)/" ||  [ "$(cat ${sysblock}/removable)" = "1" ]
 			then
+				# Assume all USB, Firewire and SD cards are external,
+				# This is the best possible guess, eg. udisks has the same logic
+				# There is NO property which indicates with certainity if a device is
+				# removable or not.
+				# Devices that contain a removable medium are considered removable
+				# too. Many (older) USB sticks also set this property although it's
+				# technically wrong. The flash chips are NOT removable from the device.
 				dev_ok="true"
-			else
-				if readlink ${sysblock} | grep -q usb
-				then
-					dev_ok="true"
-				fi
 			fi
 		fi
 
@@ -1198,7 +1220,14 @@ removable_usb_dev ()
 {
 	output_format="${1}"
 
-	removable_dev "${output_format}" "want_usb"
+	removable_dev "${output_format}" "usb"
+}
+
+removable_cdrom_dev ()
+{
+	output_format="${1}"
+
+	removable_dev "${output_format}" "cdrom"
 }
 
 non_removable_dev ()
@@ -1292,59 +1321,7 @@ do_union ()
 			rw_opt="rw"
 			ro_opt="rr+wh"
 			noxino_opt="noxino"
-			;;
 
-		unionfs-fuse)
-			rw_opt="RW"
-			ro_opt="RO"
-			;;
-
-		*)
-			rw_opt="rw"
-			ro_opt="ro"
-			;;
-	esac
-
-	case "${UNIONTYPE}" in
-		unionfs-fuse)
-			unionmountopts="-o cow -o noinitgroups -o default_permissions -o allow_other -o use_ino -o suid"
-			unionmountopts="${unionmountopts} ${unionrw}=${rw_opt}"
-			if [ -n "${unionro}" ]
-			then
-				for rofs in ${unionro}
-				do
-					unionmountopts="${unionmountopts}:${rofs}=${ro_opt}"
-				done
-			fi
-			( sysctl -w fs.file-max=391524 ; ulimit -HSn 16384
-			unionfs-fuse ${unionmountopts} "${unionmountpoint}" ) && \
-			( mkdir -p /run/sendsigs.omit.d
-			pidof unionfs-fuse >> /run/sendsigs.omit.d/unionfs-fuse || true )
-			;;
-
-		overlay)
-			# XXX: can multiple unionro be used? (overlayfs only handles two dirs, but perhaps they can be chained?)
-			# XXX: and can unionro be optional? i.e. can overlayfs skip lowerdir?
-			if echo ${unionro} | grep -q " "
-			then
-				panic "Multiple lower filesystems are currently not supported with overlayfs (unionro = ${unionro})."
-			elif [ -z "${unionro}"	]
-			then
-				panic "Overlayfs needs at least one lower filesystem (read-only branch)."
-			fi
-
-			# overlayfs requires:
-			# + a workdir to become mounted
-			# + workdir and upperdir to reside under the same mount
-			# + workdir and upperdir to be in separate directories
-			mkdir "${unionrw}/rw"
-			mkdir "${unionrw}/work"
-			unionmountopts="-o noatime,lowerdir=${unionro},upperdir=${unionrw}/rw,workdir=${unionrw}/work"
-
-			mount -t ${UNIONTYPE} ${unionmountopts} ${UNIONTYPE} "${unionmountpoint}"
-			;;
-
-		*)
 			unionmountopts="-o noatime,${noxino_opt},dirs=${unionrw}=${rw_opt}"
 			if [ -n "${unionro}" ]
 			then
@@ -1353,9 +1330,28 @@ do_union ()
 					unionmountopts="${unionmountopts}:${rofs}=${ro_opt}"
 				done
 			fi
-			mount -t ${UNIONTYPE} ${unionmountopts} ${UNIONTYPE} "${unionmountpoint}"
+			;;
+
+		overlay)
+			# XXX: can unionro be optional? i.e. can overlay skip lowerdir?
+			if [ -z "${unionro}" ]
+			then
+				panic "overlay needs at least one lower filesystem (read-only branch)."
+			fi
+			# Multiple lower layers can now be given using the the colon (":") as a
+			# separator character between the directory names.
+			unionro="$(echo ${unionro} | sed -e 's| |:|g')"
+			# overlayfs requires:
+			# + a workdir to become mounted
+			# + workdir and upperdir to reside under the same mount
+			# + workdir and upperdir to be in separate directories
+			mkdir "${unionrw}/rw"
+			mkdir "${unionrw}/work"
+			unionmountopts="-o noatime,lowerdir=${unionro},upperdir=${unionrw}/rw,workdir=${unionrw}/work"
 			;;
 	esac
+
+	mount -t ${UNIONTYPE} ${unionmountopts} ${UNIONTYPE} "${unionmountpoint}"
 }
 
 get_custom_mounts ()
@@ -1617,7 +1613,7 @@ activate_custom_mounts ()
 			do_union ${dest} ${source} ${rootfs_dest_backing}
 		elif [ -n "${opt_bind}" ] && [ -z "${PERSISTENCE_READONLY}" ]
 		then
-			mount --bind "${source}" "${dest}"
+			mount -o bind "${source}" "${dest}"
 		elif [ -n "${opt_bind}" -o -n "${opt_union}" ] && [ -n "${PERSISTENCE_READONLY}" ]
 		then
 			# bind-mount and union mount are handled the same
